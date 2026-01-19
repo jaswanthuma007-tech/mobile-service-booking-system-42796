@@ -4,9 +4,11 @@ This repository contains a simple service booking backend (Flask) intended to be
 
 ## Backend (Flask) API
 
-Base URL (dev): `http://localhost:3001`
+Base URL (dev): `http://localhost:5000` (preferred)
 
-Swagger/OpenAPI UI: `http://localhost:3001/docs`
+Swagger/OpenAPI UI: `http://localhost:5000/docs`
+
+> Note: the backend port can be overridden with `PORT` (defaults to 5000).
 
 ### Health
 - `GET /` → `{ "message": "Healthy" }`
