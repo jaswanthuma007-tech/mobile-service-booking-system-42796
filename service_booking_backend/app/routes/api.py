@@ -137,6 +137,58 @@ class Booking(MethodView):
         return booking
 
 
+class TrackingEventSchema(Schema):
+    id = fields.Int(required=True)
+    booking_id = fields.Int(required=True)
+    status = fields.Str(required=True)
+    description = fields.Str(allow_none=True)
+    timestamp = fields.Str(required=True)
+
+
+class TrackResponseSchema(Schema):
+    booking_id = fields.Int(required=True)
+    current_status = fields.Str(required=True)
+    created_at = fields.Str(required=True)
+    history = fields.List(fields.Nested(TrackingEventSchema), required=True)
+
+
+@blp.route("/track/<int:booking_id>")
+class TrackBooking(MethodView):
+    @blp.response(200, TrackResponseSchema)
+    def get(self, booking_id: int):
+        """Track a booking by id.
+
+        Returns the booking's current status + an ordered tracking timeline.
+
+        Path params:
+          - booking_id: integer
+
+        Response:
+          - booking_id
+          - current_status
+          - created_at
+          - history: [{id, booking_id, status, description, timestamp}, ...]
+        """
+        booking = db.get_booking(int(booking_id))
+        if not booking:
+            abort(404, message="Invalid booking ID. Booking not found.")
+
+        # Ensure legacy bookings have at least an initial tracking row.
+        db.ensure_initial_tracking_event_for_booking(int(booking_id))
+
+        history = db.list_tracking_history(int(booking_id))
+        current_status = (
+            history[-1]["status"] if history else booking.get("status") or "new"
+        )
+
+        return {
+            "booking_id": int(booking_id),
+            "current_status": current_status,
+            "created_at": booking["created_at"],
+            "history": history,
+        }
+
+
 admin_blp = Blueprint(
     "Admin API",
     "admin",
@@ -242,8 +294,13 @@ class AdminUpdateStatus(MethodView):
         Body:
           - booking_id: int
           - status: one of new|in_progress|completed|cancelled
+
+        Side effects:
+          - Inserts a tracking_history row for the timeline.
         """
-        updated = db.update_booking_status(int(payload["booking_id"]), payload["status"])
+        updated = db.update_booking_status_with_history(
+            int(payload["booking_id"]), payload["status"]
+        )
         if not updated:
             abort(404, message="Booking not found")
         return {"updated": True}

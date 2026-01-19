@@ -29,7 +29,11 @@ def get_connection() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Create required tables if they do not exist."""
+    """Create required tables if they do not exist.
+
+    Also performs lightweight migration steps for older DB files (e.g., adding the
+    tracking_history table) in a safe, idempotent way.
+    """
     conn = get_connection()
     try:
         conn.execute(
@@ -78,6 +82,27 @@ def init_db() -> None:
             );
             """
         )
+
+        # Booking tracking system tables
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tracking_history (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              booking_id INTEGER NOT NULL,
+              status TEXT NOT NULL,
+              description TEXT,
+              timestamp TEXT NOT NULL,
+              FOREIGN KEY(booking_id) REFERENCES bookings(id) ON DELETE CASCADE
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tracking_history_booking_id ON tracking_history(booking_id);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tracking_history_timestamp ON tracking_history(timestamp);"
+        )
+
         conn.commit()
     finally:
         conn.close()
@@ -136,6 +161,88 @@ def rows_to_dicts(rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+# PUBLIC_INTERFACE
+def add_tracking_event(
+    booking_id: int, status: str, description: Optional[str] = None
+) -> int:
+    """Insert a tracking_history row and return inserted id.
+
+    Args:
+        booking_id: The booking id.
+        status: A status string (e.g. new, in_progress, completed, etc.).
+        description: Human-friendly description shown on timeline.
+
+    Returns:
+        int: tracking_history row id.
+
+    Raises:
+        sqlite3.IntegrityError: If booking_id does not exist.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO tracking_history(booking_id, status, description, timestamp)
+            VALUES (?, ?, ?, ?);
+            """,
+            (int(booking_id), status, description, _utc_now_iso()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+# PUBLIC_INTERFACE
+def list_tracking_history(booking_id: int) -> List[Dict[str, Any]]:
+    """List tracking history events for a booking, ordered by timestamp asc.
+
+    Args:
+        booking_id: Booking id.
+
+    Returns:
+        List of events as dicts with keys: id, booking_id, status, description, timestamp.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, booking_id, status, description, timestamp
+            FROM tracking_history
+            WHERE booking_id = ?
+            ORDER BY timestamp ASC, id ASC;
+            """,
+            (int(booking_id),),
+        ).fetchall()
+        return rows_to_dicts(rows)
+    finally:
+        conn.close()
+
+
+# PUBLIC_INTERFACE
+def ensure_initial_tracking_event_for_booking(booking_id: int) -> None:
+    """Ensure a newly-created booking has an initial 'Booking Confirmed' tracking row."""
+    conn = get_connection()
+    try:
+        existing = conn.execute(
+            "SELECT 1 FROM tracking_history WHERE booking_id = ? LIMIT 1;",
+            (int(booking_id),),
+        ).fetchone()
+        if existing:
+            return
+
+        conn.execute(
+            """
+            INSERT INTO tracking_history(booking_id, status, description, timestamp)
+            VALUES (?, ?, ?, ?);
+            """,
+            (int(booking_id), "new", "Booking Confirmed", _utc_now_iso()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def create_booking(data: Dict[str, Any]) -> int:
     """Insert booking and return booking id."""
     conn = get_connection()
@@ -159,8 +266,20 @@ def create_booking(data: Dict[str, Any]) -> int:
                 _utc_now_iso(),
             ),
         )
+        booking_id = int(cur.lastrowid)
+
+        # Create initial timeline row.
+        # Keep this in the same transaction/connection to minimize race conditions.
+        conn.execute(
+            """
+            INSERT INTO tracking_history(booking_id, status, description, timestamp)
+            VALUES (?, ?, ?, ?);
+            """,
+            (booking_id, "new", "Booking Confirmed", _utc_now_iso()),
+        )
+
         conn.commit()
-        return int(cur.lastrowid)
+        return booking_id
     finally:
         conn.close()
 
@@ -299,8 +418,56 @@ def list_admin_bookings(
         conn.close()
 
 
+# PUBLIC_INTERFACE
+def update_booking_status_with_history(
+    booking_id: int, status: str, description: Optional[str] = None
+) -> bool:
+    """Update a booking status and also insert a tracking_history row.
+
+    Args:
+        booking_id: Booking id.
+        status: New status value.
+        description: Optional timeline description; if not supplied, a reasonable default is used.
+
+    Returns:
+        True if booking existed and was updated, False otherwise.
+    """
+    default_description_by_status = {
+        "new": "Booking Confirmed",
+        "in_progress": "Repair In Progress",
+        "completed": "Delivered",
+        "cancelled": "Cancelled",
+    }
+    desc = description if description is not None else default_description_by_status.get(status)
+
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "UPDATE bookings SET status = ? WHERE id = ?;",
+            (status, int(booking_id)),
+        )
+        if cur.rowcount <= 0:
+            conn.rollback()
+            return False
+
+        conn.execute(
+            """
+            INSERT INTO tracking_history(booking_id, status, description, timestamp)
+            VALUES (?, ?, ?, ?);
+            """,
+            (int(booking_id), status, desc, _utc_now_iso()),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
 def update_booking_status(booking_id: int, status: str) -> bool:
-    """Update booking status; return True if booking existed."""
+    """Update booking status; return True if booking existed.
+
+    Note: Kept for backwards compatibility. Prefer update_booking_status_with_history().
+    """
     conn = get_connection()
     try:
         cur = conn.execute(
